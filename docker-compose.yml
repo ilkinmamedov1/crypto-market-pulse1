@@ -1,0 +1,115 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: crypto_postgres_local
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-crypto_market}
+      POSTGRES_USER: ${POSTGRES_USER:-crypto_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-12345}
+    ports:
+      - "5432:5432"
+    volumes:
+      - crypto_pg_data_local:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-crypto_user} -d $${POSTGRES_DB:-crypto_market}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  init_db:
+    build: .
+    container_name: crypto_init_db
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python src/init_database.py
+
+  realtime_ingestor:
+    build: .
+    container_name: crypto_realtime_ingestor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+    depends_on:
+      init_db:
+        condition: service_completed_successfully
+    command: python src/ingest_binance_ticker_history.py
+
+  daily_sync:
+    build: .
+    container_name: crypto_daily_sync
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      DAILY_SYNC_SECONDS: 86400
+    depends_on:
+      init_db:
+        condition: service_completed_successfully
+    command: >
+      sh -c "while true; do
+      echo 'Starting daily historical sync...';
+      python src/sync_daily_klines_full.py;
+      echo 'Daily sync finished. Sleeping...';
+      sleep $${DAILY_SYNC_SECONDS};
+      done"
+
+  coingecko_sync:
+    build: .
+    container_name: crypto_coingecko_sync
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      COINGECKO_SYNC_SECONDS: 43200
+    depends_on:
+      init_db:
+        condition: service_completed_successfully
+    command: >
+      sh -c "while true; do
+      echo 'Starting CoinGecko metadata sync...';
+      python src/sync_coingecko_market_meta.py;
+      echo 'CoinGecko sync finished. Sleeping...';
+      sleep $${COINGECKO_SYNC_SECONDS};
+      done"
+
+  alert_worker:
+    build: .
+    container_name: crypto_alert_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+    depends_on:
+      init_db:
+        condition: service_completed_successfully
+    command: python src/check_alerts.py
+
+  web_app:
+    build: .
+    container_name: crypto_web_app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+    ports:
+      - "8000:8000"
+    depends_on:
+      init_db:
+        condition: service_completed_successfully
+    command: uvicorn src.web_app.main:app --host 0.0.0.0 --port 8000
+
+volumes:
+  crypto_pg_data_local:
